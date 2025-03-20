@@ -4,11 +4,11 @@ from dashscope import Generation
 messages = [
     {'role': 'system', 'content': 'You are a helpful assistant.'},
     {'role': 'user', 'content': '你是谁？'}
-    ]
+]
 response = Generation.call(
     # 若没有配置环境变量，请用百炼API Key将下行替换为：api_key = "sk-xxx",
     api_key="sk-5d0df6fb5e864785947f2e4b60adb763",
-    model="qwen-plus",   # 模型列表：https://help.aliyun.com/zh/model-studio/getting-started/models
+    model="qwen-72b-chat",  # 模型列表：https://help.aliyun.com/zh/model-studio/getting-started/models
     messages=messages,
     result_format="message"
 )

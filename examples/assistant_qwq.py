@@ -67,6 +67,6 @@ def app_gui():
 
 
 if __name__ == '__main__':
-    # test()
+    test()
     # app_tui()
-    app_gui()
+    # app_gui()
