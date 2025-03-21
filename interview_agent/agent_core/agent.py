@@ -1,6 +1,7 @@
+from interview_agent.agent_core.config import Config
 from qwen_agent.agents import Assistant
 
-question_agent_prompt = """
+questionAgentPrompt = """
 # 角色
 你是一个专业的面试评价官，专门负责对有 3 年左右工作经验的 Python 后端开发岗位求职者进行模拟面试。你的服务价格昂贵（2000 块一小时），所以必须提供专业且实用的服务，让面试者觉得物有所值。
 
@@ -19,6 +20,18 @@ question_agent_prompt = """
 -- 不可以❌：以下是一道 3 年左右工作经验的 Python 后端开发岗位的面试题：“<面试题>”
 -- 可以✅：<面试题>
 """
+PressureAgentPrompt = """"""
+
+class dealLLMResponse:
+    @staticmethod
+    def deal_response(LLMType,response):
+        res_msg = ""
+        if LLMType == Config.model_type:
+            for _res in response:
+                if _res[0]["extra"]["model_service_info"]["output"]["choices"][0]["finish_reason"] == "stop":
+                    res_msg += _res[0]["content"]
+                    break
+        return res_msg
 
 
 class QuestionSetterAgent:
@@ -26,16 +39,15 @@ class QuestionSetterAgent:
 
     def __init__(self):
         self.llm_cfg = {
-            'model': 'qwen-72b-chat',
-            'model_type': 'qwen_dashscope',
-            "system": question_agent_prompt,
+            'model': Config.model,
+            'model_type': Config.model_type,
+            "system": questionAgentPrompt,
             'generate_cfg': {
             }
         }
         self.tools = []
 
     def agent(self,query):
-        res_msg = ""
         bot = Assistant(
             llm=self.llm_cfg,
             function_list=self.tools,
@@ -44,11 +56,58 @@ class QuestionSetterAgent:
         if query:
             messages = [{'role': 'user', 'content': query}]
             res = bot.run(messages=messages)
-            for _res in res:
-                if _res[0]["extra"]["model_service_info"]["output"]["choices"][0]["finish_reason"] == "stop":
-                    res_msg += _res[0]["content"]
-                    break
-        return res_msg
+            return dealLLMResponse.deal_response(Config.model_type,res)
+        return None
+
+
+class PressureSimulationIntelligentAgent:
+    """压力测试智能体"""
+    def __init__(self):
+        self.llm_cfg = {
+            'model': Config.model,
+            'model_type': Config.model_type,
+            "system": PressureAgentPrompt,
+            'generate_cfg': {
+            }
+        }
+        self.tools = []
+
+    def agent(self,query):
+        bot = Assistant(
+            llm=self.llm_cfg,
+            function_list=self.tools,
+            name='qwen-72b-chat Demo',
+            description="qwen-72b-chat demo")
+        if query:
+            messages = [{'role': 'user', 'content': query}]
+            res = bot.run(messages=messages)
+            return dealLLMResponse.deal_response(Config.model_type,res)
+        return None
+
+class BehaviorAnalysisAgent:
+    """行为分析智能体"""
+    def __init__(self):
+        self.llm_cfg = {
+            'model': Config.model,
+            'model_type': Config.model_type,
+            "system": questionAgentPrompt,
+            'generate_cfg': {
+            }
+        }
+        self.tools = []
+
+    def agent(self,query):
+        bot = Assistant(
+            llm=self.llm_cfg,
+            function_list=self.tools,
+            name='qwen-72b-chat Demo',
+            description="qwen-72b-chat demo")
+        if query:
+            messages = [{'role': 'user', 'content': query}]
+            res = bot.run(messages=messages)
+            return dealLLMResponse.deal_response(Config.model_type,res)
+        return None
+
 
 if __name__ == '__main__':
     question_setter = QuestionSetterAgent()
