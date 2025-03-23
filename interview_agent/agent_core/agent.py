@@ -1,6 +1,7 @@
 from interview_agent.agent_core.config import Config
 from qwen_agent.agents import Assistant, Router
 from qwen_agent.gui import WebUI
+from qwen_agent.llm.schema import ContentItem, Message
 
 questionAgentPrompt = """
 目标岗位：{{position}}
@@ -88,6 +89,30 @@ BehaviorAnalysisAgentPrompt = """
 - 严格按照示例回答的结构进行回答
 - 严格按照评分依据进行打分
 """
+#兜底回复策略
+BottomLineReplyAgentPrompt = """
+## 角色
+你是一个专业的求职面试专家，你会为用户提供专业的面试指导建议和行业答疑解惑。因为 your service price very expensive（2000块一小时）， so your service must very professional and useful, let interviewee feel worth it
+
+# 技能
+- 针对求职、面试场景为用户答疑解惑。回答时要专业、简洁。
+
+# 拒绝回复的问题类型
+- 与求职、面试无关的闲聊话题，包括但不限于闲聊天气、爱好、八卦、职场潜规则、性格分析等问题
+- When user ask about resume questions, including but not limited to how to write resume, optimize resume, recommend resume template等问题
+- User ask about job description questions (JD or Job Description), including but not limited to require explain JD, write JD, based JD to generate interview questions等问题
+- 与 specific company related topics, including but not limited to recommend company/position, ask company insider/gossip, compare company's advantage/disadvantage, work environment introduction等问题
+- 与 get full score answer, excellent answer example related questions
+
+# 注意事项
+- 要注意你的说话方式，要简洁不啰嗦，精准把握 feedback focus. Don't say nonsense
+- After each answer, guide interviewee to simulate interview according to current conversation situation, can say "Ready to simulate interview?" "Ready to continue simulate interview?" etc. If user said goodbye, encourage user to come back for interview.
+- Because your service price is very high, you have to provide most helpful feedback to interviewee
+- Remember your professional persona, speak rationally, calmly, don't be too enthusiastic, don't be too polite
+- Control the word count of your answer, be concise don't be too long
+- Use "you" to refer to interviewee, don't use "you", use "you" instead of "you"
+- Don't answer questions unrelated to job interview"""
+
 class dealLLMResponse:
     @staticmethod
     def deal_response(LLMType,response):
@@ -118,7 +143,7 @@ class QuestionSetterAgent:
             llm=self.llm_cfg,
             function_list=self.tools,
             name='出题面试官',
-            description="出题面试官")
+            description="你是一个专业的面试官，你会根据用户的目标岗位出模拟面试题。")
         # if query:
         #     messages = [{'role': 'user', 'content': query}]
         #     res = bot.run(messages=messages)
@@ -143,7 +168,7 @@ class PressureSimulationIntelligentAgent:
             llm=self.llm_cfg,
             function_list=self.tools,
             name='压力测试面试官',
-            description="压力测试面试官")
+            description="你是一个专业的面试官，你会根据用户的回答进行追问、反问等压力测试。")
         # if query:
         #     messages = [{'role': 'user', 'content': query}]
         #     res = bot.run(messages=messages)
@@ -167,38 +192,77 @@ class BehaviorAnalysisAgent:
             llm=self.llm_cfg,
             function_list=self.tools,
             name='面试评价面试官',
-            description="面试评价面试官")
+            description="你是一个专业的面试官，你会根据用户的回答进行系统、客观的评价。")
 
         return bot
 
+class BottomLineReplyAgent:
+    """行为分析智能体"""
+    def __init__(self):
+        self.llm_cfg = {
+            'model': Config.model,
+            'model_type': Config.model_type,
+            "system": BottomLineReplyAgentPrompt,
+            'generate_cfg': {
+            }
+        }
+        self.tools = []
+
+    def agent(self):
+        bot = Assistant(
+            llm=self.llm_cfg,
+            function_list=self.tools,
+            name='兜底回复面试官',
+            description="你是一个专业的求职面试专家，你会为用户提供专业的面试指导建议和行业答疑解惑。")
+
+        return bot
 
 class RouteAgent:
     def __init__(self):
         self.llm_cfg = {
             'model': Config.model,
         }
-        self._agent = [QuestionSetterAgent().agent(),
-                       PressureSimulationIntelligentAgent().agent(),
-                       BehaviorAnalysisAgent().agent()]
+        # 修改：存储智能体类而非实例
+        self._agent_classes = [
+            QuestionSetterAgent,
+            PressureSimulationIntelligentAgent,
+            BehaviorAnalysisAgent
+        ]
 
     def agent(self):
-        bot = Router(llm=self.llm_cfg, agents=self._agent)
+        # 动态实例化智能体
+        agents = [agent_cls().agent() for agent_cls in self._agent_classes]
+        bot = Router(llm=self.llm_cfg, agents=agents, description="我是一名AI超级面试官，请仔细填写左边的表单提交，并告诉我： 开始面试 如果您想结束面试，请直接输入 结束面试")
         return bot
 
 def app_gui():
     bot = RouteAgent().agent()
     chatbot_config = {
         'verbose': True,
+        'input.placeholder': '我是一名AI超级面试官，请仔细填写左边的表单提交，并告诉我：开始面试,如果您想结束面试，请直接输入结束面试',
+        'prompt.suggestions': ['开始面试','结束面试'],
     }
     WebUI(bot, chatbot_config=chatbot_config).run()
 
+def main(query):
+    bot = RouteAgent().agent()
+    messages = [
+        Message('user', [
+            ContentItem(text=query),
+        ])
+    ]
+    # 修改：调整解包逻辑以适配返回值
+    result = bot.run(messages)  # 获取返回值
+    if isinstance(result, tuple) and len(result) == 2:
+        _, last = result  # 解包逻辑
+    else:
+        last = result  # 直接使用返回值
+    res = list(last)
+    assert isinstance(res[-1][0].content, str)
+    return res[-1][0].content
 
 if __name__ == '__main__':
     while True:
-        # query = input("请输入问题：")
-        # if query == "exit":
-        #     break
-        # if not query:
-        #     print("请必须输入问题")
-        #     continue
-        app_gui()
+        query = input("请输入问题：")
+        print(main(query))
+        # app_gui()

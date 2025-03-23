@@ -1,4 +1,4 @@
 
 class Config:
-    model = "qwen-vl-plus"
+    model = "qwen-max"
     model_type = "qwen_dashscope"
