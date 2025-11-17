@@ -1,3 +1,17 @@
+# Copyright 2023 The Qwen team, Alibaba Group. All rights reserved.
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+#    http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """An image generation agent implemented by assistant with qwq"""
 
 import os
@@ -14,7 +28,13 @@ def init_agent_service():
         'model': 'qwq-32b',
         'model_type': 'qwen_dashscope',
         'generate_cfg': {
-            'fncall_prompt_type': 'nous'
+            'fncall_prompt_type': 'nous',
+
+            # This parameter needs to be passed in when the deployed model is an reasoning model (e.g. qwq-32b) and *does not* support the reasoning_content field (e.g. deploying qwq-32b directly with an old version of vLLM)
+            # Add: When the content is `<think>this is the thought</think>this is the answer`
+            # Do not add: When the response has been separated by reasoning_content and content
+            # This parameter will affect the parsing strategy of tool call
+            # 'thought_in_content': True,
         },
     }
     tools = [

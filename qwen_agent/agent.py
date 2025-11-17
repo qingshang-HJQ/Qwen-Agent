@@ -1,3 +1,17 @@
+# Copyright 2023 The Qwen team, Alibaba Group. All rights reserved.
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+#    http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import copy
 import json
 import traceback
@@ -94,22 +108,18 @@ class Agent(ABC):
                 kwargs['lang'] = 'en'
 
         if self.system_message:
-            if new_messages[0][ROLE] != SYSTEM:
-                # Add the system instruction to the agent, default to `DEFAULT_SYSTEM_MESSAGE`
+            if not new_messages or new_messages[0][ROLE] != SYSTEM:
+                # Add the system instruction to the agent
                 new_messages.insert(0, Message(role=SYSTEM, content=self.system_message))
             else:
-                # When the messages contain system message
-                if self.system_message != DEFAULT_SYSTEM_MESSAGE:
-                    # If the user has set a special system that does not exist in messages, add
-                    if isinstance(new_messages[0][CONTENT], str):
-                        if not new_messages[0][CONTENT].startswith(self.system_message):
-                            new_messages[0][CONTENT] = self.system_message + '\n\n' + new_messages[0][CONTENT]
-                    else:
-                        assert isinstance(new_messages[0][CONTENT], list)
-                        assert new_messages[0][CONTENT][0].text
-                        if not new_messages[0][CONTENT][0].text.startswith(self.system_message):
-                            new_messages[0][CONTENT] = [ContentItem(text=self.system_message + '\n\n')
-                                                       ] + new_messages[0][CONTENT]  # noqa
+                # Already got system message in new_messages
+                if isinstance(new_messages[0][CONTENT], str):
+                    new_messages[0][CONTENT] = self.system_message + '\n\n' + new_messages[0][CONTENT]
+                else:
+                    assert isinstance(new_messages[0][CONTENT], list)
+                    assert new_messages[0][CONTENT][0].text
+                    new_messages[0][CONTENT] = [ContentItem(text=self.system_message + '\n\n')
+                                               ] + new_messages[0][CONTENT]  # noqa
 
         for rsp in self._run(messages=new_messages, **kwargs):
             for i in range(len(rsp)):

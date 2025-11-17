@@ -1,3 +1,17 @@
+# Copyright 2023 The Qwen team, Alibaba Group. All rights reserved.
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+#    http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import re
 
 from setuptools import find_packages, setup
@@ -52,7 +66,8 @@ setup(
         'pydantic>=2.3.0',
         'requests',
         'tiktoken',
-        'mcp',
+        'pillow',
+        'dotenv',
     ],
     extras_require={
         # Extra dependencies for RAG:
@@ -69,6 +84,9 @@ setup(
             'pandas',
             'tabulate',
         ],
+
+        # Extra dependencies for MCP:
+        'mcp': ['mcp'],
 
         # Extra dependencies for Python Executor, which is primarily for solving math problems:
         'python_executor': [
@@ -100,9 +118,9 @@ setup(
             # Gradio has bad version compatibility. Therefore, we use `==` instead of `>=`.
             'pydantic==2.9.2',
             'pydantic-core==2.23.4',
-            'gradio>=5.0.0',
-            'gradio-client==1.4.0',
-            'modelscope_studio==1.0.0-beta.8',
+            'gradio==5.23.1',
+            'gradio-client==1.8.0',
+            'modelscope_studio==1.1.7',
         ],
     },
     url='https://github.com/QwenLM/Qwen-Agent',

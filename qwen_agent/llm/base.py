@@ -1,13 +1,28 @@
+# Copyright 2023 The Qwen team, Alibaba Group. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import copy
 import json
 import os
 import random
 import time
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from pprint import pformat
 from typing import Any, Dict, Iterator, List, Literal, Optional, Tuple, Union
 
-from qwen_agent.llm.schema import ASSISTANT, DEFAULT_SYSTEM_MESSAGE, SYSTEM, USER, Message
+from qwen_agent.llm.schema import ASSISTANT, DEFAULT_SYSTEM_MESSAGE, FUNCTION, SYSTEM, USER, Message
 from qwen_agent.log import logger
 from qwen_agent.settings import DEFAULT_MAX_INPUT_TOKENS
 from qwen_agent.utils.tokenization_qwen import tokenizer
@@ -56,6 +71,10 @@ class BaseChatModel(ABC):
         # Does the model generate multimodal outputs beyond texts? It affects how we post-process the output.
         return False
 
+    @property
+    def support_audio_input(self) -> bool:
+        return False
+
     def __init__(self, cfg: Optional[Dict] = None):
         cfg = cfg or {}
         self.model = cfg.get('model', '').strip()
@@ -64,6 +83,17 @@ class BaseChatModel(ABC):
         self.max_retries = generate_cfg.pop('max_retries', 0)
         self.generate_cfg = generate_cfg
         self.model_type = cfg.get('model_type', '')
+        if 'dashscope' in self.model_type:
+            self.generate_cfg['incremental_output'] = True
+
+        self.use_raw_api = os.getenv('QWEN_AGENT_USE_RAW_API', 'false').lower() == 'true'
+        if 'use_raw_api' in generate_cfg:
+            self.use_raw_api = generate_cfg.pop('use_raw_api')
+        elif self.model_type == 'qwen_dashscope':
+            # set qwen3-max to `use_raw_api`
+            if self.model == 'qwen3-max' and (not self.use_raw_api):
+                logger.info('Setting `use_raw_api` to True when using `Qwen3-Max`')
+                self.use_raw_api = True
 
         if cache_dir:
             try:
@@ -102,7 +132,7 @@ class BaseChatModel(ABC):
             delta_stream: Whether to stream the response incrementally.
               (1) When False (recommended): Stream the full response every iteration.
               (2) When True: Stream the chunked response, i.e, delta responses.
-            extra_generate_cfg: Extra LLM generation hyper-paramters.
+            extra_generate_cfg: Extra LLM generation hyper-parameters.
 
         Returns:
             the generated message list response by llm.
@@ -120,24 +150,8 @@ class BaseChatModel(ABC):
                 _return_message_type = 'message'
         messages = new_messages
 
-        # RM think for non-qwq
-        if 'qwq' not in self.model.lower():
-            SPECIAL_THOUGHT_TOKEN = '<think>'
-            new_messages = []
-            for msg in messages:
-                if msg.role == ASSISTANT:
-                    if isinstance(msg.content, str):
-                        if SPECIAL_THOUGHT_TOKEN in msg.content:
-                            msg.content = _rm_think(msg.content)
-                    elif isinstance(msg.content, list):
-                        for i, item in enumerate(msg.content):
-                            if item.text:
-                                if SPECIAL_THOUGHT_TOKEN in item.text:
-                                    item.text = _rm_think(item.text)
-                                    msg.content[i] = item
-                                break
-                new_messages.append(msg)
-            messages = new_messages
+        if not messages:
+            raise ValueError('Messages can not be empty.')
 
         # Cache lookup:
         if self.cache is not None:
@@ -166,10 +180,10 @@ class BaseChatModel(ABC):
             lang: Literal['en', 'zh'] = generate_cfg.pop('lang')
         else:
             lang: Literal['en', 'zh'] = 'zh' if has_chinese_messages(messages) else 'en'
-        if self.model_type == 'qwen_dashscope' and stream:
-            generate_cfg['incremental_output'] = True
+        if not stream and 'incremental_output' in generate_cfg:
+            generate_cfg.pop('incremental_output')
 
-        if messages[0].role != SYSTEM:
+        if DEFAULT_SYSTEM_MESSAGE and messages[0].role != SYSTEM:
             messages = [Message(role=SYSTEM, content=DEFAULT_SYSTEM_MESSAGE)] + messages
 
         # Not precise. It's hard to estimate tokens related with function calling and multimodal items.
@@ -195,12 +209,21 @@ class BaseChatModel(ABC):
                 fncall_mode = False
 
         # Note: the preprocessor's behavior could change if it receives function_choice="none"
-        messages = self._preprocess_messages(messages, lang=lang, generate_cfg=generate_cfg, functions=functions)
+        messages = self._preprocess_messages(messages,
+                                             lang=lang,
+                                             generate_cfg=generate_cfg,
+                                             functions=functions,
+                                             use_raw_api=self.use_raw_api)
         if not self.support_multimodal_input:
             messages = [format_as_text_message(msg, add_upload_info=False) for msg in messages]
 
+        if self.use_raw_api:
+            logger.debug('`use_raw_api` takes effect.')
+            assert stream and (not delta_stream), '`use_raw_api` only support full stream!!!'
+            return self.raw_chat(messages=messages, functions=functions, stream=stream, generate_cfg=generate_cfg)
+
         if not fncall_mode:
-            for k in ['parallel_function_calls', 'function_choice']:
+            for k in ['parallel_function_calls', 'function_choice', 'thought_in_content']:
                 if k in generate_cfg:
                     del generate_cfg[k]
 
@@ -237,7 +260,7 @@ class BaseChatModel(ABC):
 
         if isinstance(output, list):
             assert not stream
-            logger.debug(f'LLM Output:\n{pformat([_.model_dump() for _ in output], indent=2)}')
+            logger.debug(f'LLM Output: \n{pformat([_.model_dump() for _ in output], indent=2)}')
             output = self._postprocess_messages(output, fncall_mode=fncall_mode, generate_cfg=generate_cfg)
             if not self.support_multimodal_output:
                 output = _format_as_text_messages(messages=output)
@@ -321,14 +344,19 @@ class BaseChatModel(ABC):
         lang: Literal['en', 'zh'],
         generate_cfg: dict,
         functions: Optional[List[Dict]] = None,
+        use_raw_api: bool = False,
     ) -> List[Message]:
         add_multimodel_upload_info = False
         if functions or (not self.support_multimodal_input):
             add_multimodel_upload_info = True
+        add_audio_upload_info = False
+        if functions or (not self.support_audio_input):
+            add_audio_upload_info = True
         messages = [
             format_as_multimodal_message(msg,
                                          add_upload_info=True,
                                          add_multimodel_upload_info=add_multimodel_upload_info,
+                                         add_audio_upload_info=add_audio_upload_info,
                                          lang=lang) for msg in messages
         ]
         return messages
@@ -340,8 +368,10 @@ class BaseChatModel(ABC):
         generate_cfg: dict,
     ) -> List[Message]:
         messages = [
-            format_as_multimodal_message(msg, add_upload_info=False, add_multimodel_upload_info=False)
-            for msg in messages
+            format_as_multimodal_message(msg,
+                                         add_upload_info=False,
+                                         add_multimodel_upload_info=False,
+                                         add_audio_upload_info=False) for msg in messages
         ]
         if not generate_cfg.get('skip_stopword_postproc', False):
             stop = generate_cfg.get('stop', [])
@@ -357,7 +387,7 @@ class BaseChatModel(ABC):
         pre_msg = []
         for pre_msg in messages:
             yield self._postprocess_messages(pre_msg, fncall_mode=fncall_mode, generate_cfg=generate_cfg)
-        logger.debug(f'LLM Output:\n{pformat([_.model_dump() for _ in pre_msg], indent=2)}')
+        logger.debug(f'LLM Output: \n{pformat([_.model_dump() for _ in pre_msg], indent=2)}')
 
     def _convert_messages_to_target_type(self, messages: List[Message],
                                          target_type: str) -> Union[List[Message], List[Dict]]:
@@ -374,6 +404,134 @@ class BaseChatModel(ABC):
         for messages in messages_iter:
             yield self._convert_messages_to_target_type(messages, target_type)
 
+    def raw_chat(
+        self,
+        messages: List[Union[Message, Dict]],
+        functions: Optional[List[Dict]] = None,
+        stream: bool = True,
+        generate_cfg: Optional[Dict] = None,
+    ) -> Union[List[Message], List[Dict], Iterator[List[Message]], Iterator[List[Dict]]]:
+        if functions and functions[0].get('type') != 'function':
+            functions = [{'type': 'function', 'function': f} for f in functions]
+        if functions:
+            generate_cfg['tools'] = functions
+        if stream:
+            return self._chat_stream(messages=messages, delta_stream=False, generate_cfg=generate_cfg)
+
+    @staticmethod
+    def _conv_qwen_agent_messages_to_oai(messages: List[Union[Message, Dict]]):
+        new_messages = []
+        for msg in messages:
+            if msg['role'] == ASSISTANT:
+                if new_messages[-1]['role'] != ASSISTANT:
+                    new_messages.append({'role': ASSISTANT})
+                if msg.get('content'):
+                    new_messages[-1]['content'] = msg['content']
+                if msg.get('reasoning_content'):
+                    new_messages[-1]['reasoning_content'] = msg['reasoning_content']
+                if msg.get('function_call'):
+                    if not new_messages[-1].get('tool_calls'):
+                        new_messages[-1]['tool_calls'] = []
+                    new_messages[-1]['tool_calls'].append({
+                        'id': msg.get('extra', {}).get('function_id', '1'),
+                        'type': 'function',
+                        'function': {
+                            'name': msg['function_call']['name'],
+                            'arguments': msg['function_call']['arguments']
+                        }
+                    })
+            elif msg['role'] == FUNCTION:
+                new_msg = copy.deepcopy(msg)
+                new_msg['role'] = 'tool'
+                new_msg['id'] = msg.get('extra', {}).get('function_id', '1')
+                new_messages.append(new_msg)
+            else:
+                new_messages.append(msg)
+        return new_messages
+
+    def quick_chat_oai(self, messages: List[dict], tools: Optional[list] = None) -> dict:
+        """
+        This is a temporary OpenAI-compatible interface that is encapsulated and may change at any time.
+        It is mainly used for temporary interfaces and should not be overly dependent.
+        - Only supports full streaming
+        - The message is in dict format
+        - Only supports text LLM
+        """
+
+        def _convert_to_qwen_agent_messages(messages):
+            new_messages = []
+            for msg in messages:
+                if msg['role'] in ['system', 'user']:
+                    new_messages.append(msg)
+                elif msg['role'] == 'tool':
+                    new_msg = copy.deepcopy(msg)
+                    new_msg['role'] = 'function'
+                    new_messages.append(new_msg)
+                elif msg['role'] == 'assistant':
+                    if msg['content']:
+                        new_messages.append({'role': 'assistant', 'content': msg['content']})
+                    if msg.get('reasoning_content', ''):
+                        new_messages.append({
+                            'role': 'assistant',
+                            'content': '',
+                            'reasoning_content': msg['reasoning_content']
+                        })
+                    if msg.get('tool_calls'):
+                        for tool in msg.get('tool_calls'):
+                            new_messages.append({
+                                'role': 'assistant',
+                                'content': '',
+                                'function_call': {
+                                    'name': tool['function']['name'],
+                                    'arguments': tool['function']['arguments']
+                                }
+                            })
+            return new_messages
+
+        def _convert_to_oai_message(data):
+            message = {'role': 'assistant', 'content': '', 'reasoning_content': '', 'tool_calls': []}
+
+            for item in data:
+                if item.get('reasoning_content'):
+                    message['reasoning_content'] += item['reasoning_content']
+
+                if item.get('content'):
+                    message['content'] += item['content']
+
+                if item.get('function_call'):
+                    tool_call = {
+                        'id': f"{len(message['tool_calls']) + 1}",
+                        'type': 'function',
+                        'function': {
+                            'name': item['function_call']['name'],
+                            'arguments': item['function_call']['arguments']
+                        }
+                    }
+                    message['tool_calls'].append(tool_call)
+            # Fake token usage
+            response = {
+                'choices': [{
+                    'message': message
+                }],
+                'usage': {
+                    'prompt_tokens': 0,
+                    'completion_tokens': 0,
+                    'total_tokens': 0
+                }
+            }
+            return response
+
+        if tools:
+            functions = [tool['function'] for tool in tools]
+        else:
+            functions = None
+        for rsp in self.chat(
+                messages=_convert_to_qwen_agent_messages(messages),
+                functions=functions,
+                stream=True,
+        ):
+            yield _convert_to_oai_message(rsp)
+
 
 def _format_as_text_messages(messages: List[Message]) -> List[Message]:
     for msg in messages:
@@ -388,6 +546,8 @@ def _format_as_text_messages(messages: List[Message]) -> List[Message]:
 
 def _postprocess_stop_words(messages: List[Message], stop: List[str]) -> List[Message]:
     messages = copy.deepcopy(messages)
+    if not messages:
+        return messages
 
     # Make sure it stops before stop words.
     trunc_messages = []
@@ -416,14 +576,15 @@ def _postprocess_stop_words(messages: List[Message], stop: List[str]) -> List[Me
             s = tokenizer.convert_tokens_to_string(s)
             partial_stop.append(s)
     partial_stop = sorted(set(partial_stop))
-    last_msg = messages[-1].content
-    for i in range(len(last_msg) - 1, -1, -1):
-        item_type, item_text = last_msg[i].get_type_and_value()
-        if item_type == 'text':
-            for s in partial_stop:
-                if item_text.endswith(s):
-                    last_msg[i].text = item_text[:-len(s)]
-            break
+    if messages:
+        last_msg = messages[-1].content
+        for i in range(len(last_msg) - 1, -1, -1):
+            item_type, item_text = last_msg[i].get_type_and_value()
+            if item_type == 'text':
+                for s in partial_stop:
+                    if item_text.endswith(s):
+                        last_msg[i].text = item_text[:-len(s)]
+                break
 
     return messages
 
@@ -439,18 +600,20 @@ def _truncate_at_stop_word(text: str, stop: List[str]):
 
 
 def _truncate_input_messages_roughly(messages: List[Message], max_tokens: int) -> List[Message]:
-    sys_msg = messages[0]
-    assert sys_msg.role == SYSTEM  # The default system is prepended if none exists
     if len([m for m in messages if m.role == SYSTEM]) >= 2:
         raise ModelServiceError(
             code='400',
             message='The input messages must contain no more than one system message. '
             ' And the system message, if exists, must be the first message.',
         )
+    if not messages:
+        return messages
 
     turns = []
-    for m in messages[1:]:
-        if m.role == USER:
+    for m in messages:
+        if m.role == SYSTEM:
+            continue
+        elif m.role == USER:
             turns.append([m])
         else:
             if turns:
@@ -462,11 +625,13 @@ def _truncate_input_messages_roughly(messages: List[Message], max_tokens: int) -
                 )
 
     def _count_tokens(msg: Message) -> int:
+        if msg.role == ASSISTANT and msg.function_call:
+            return tokenizer.count_tokens(f'{msg.function_call}')
         return tokenizer.count_tokens(extract_text_from_message(msg, add_upload_info=True))
 
-    def _truncate_message(msg: Message, max_tokens: int):
+    def _truncate_message(msg: Message, max_tokens: int, keep_both_sides: bool = False):
         if isinstance(msg.content, str):
-            content = tokenizer.truncate(msg.content, max_token=max_tokens)
+            content = tokenizer.truncate(msg.content, max_token=max_tokens, keep_both_sides=keep_both_sides)
         else:
             text = []
             for item in msg.content:
@@ -474,35 +639,168 @@ def _truncate_input_messages_roughly(messages: List[Message], max_tokens: int) -
                     return None
                 text.append(item.text)
             text = '\n'.join(text)
-            content = tokenizer.truncate(text, max_token=max_tokens)
+            content = tokenizer.truncate(text, max_token=max_tokens, keep_both_sides=keep_both_sides)
         return Message(role=msg.role, content=content)
 
-    available_token = max_tokens - _count_tokens(sys_msg)
-    token_cnt = 0
-    new_messages = []
-    for i in range(len(messages) - 1, 0, -1):
-        cur_token_cnt = _count_tokens(messages[i])
-        if cur_token_cnt <= available_token:
-            new_messages = [messages[i]] + new_messages
-            available_token -= cur_token_cnt
-        else:
-            if (messages[i].role == USER) and (i != len(messages) - 1):
-                _msg = _truncate_message(messages[i], max_tokens=available_token)
-                if _msg:
-                    new_messages = [_msg] + new_messages
+    def _truncate_turn(indexed_messages1: list, message_tokens1: dict, exceedance: int, is_last_turn: bool):
+        # ******* rm this turn *******
+        all_tokens = 0
+        for msg_idx, msg in indexed_messages1:
+            all_tokens += message_tokens1[msg_idx]
+        logger.debug(f'exceedance start: {exceedance}, all tokens of this turn {all_tokens}')
+        if all_tokens <= exceedance:
+            # remove all turn
+            return [], (exceedance - all_tokens)
+
+        # ******* trunk this turn *******
+        if len(indexed_messages1) == 1:
+            assert is_last_turn
+            # very long user
+            idx, msg = indexed_messages1[0]
+            msg = _truncate_message(msg=msg, max_tokens=message_tokens1[idx] - exceedance, keep_both_sides=True)
+            return [msg], 0
+
+        indexed_messages1 = copy.deepcopy(indexed_messages1)
+        message_tokens1 = copy.deepcopy(message_tokens1)
+
+        # split this turn by step
+        messages_per_step = []  # [ [ (idx, msg), (idx, msg) ], [], ... ]
+        for msg_idx, msg in indexed_messages1:
+            if msg.role == USER:
+                if messages_per_step and messages_per_step[-1][-1][1].role == USER:
+                    messages_per_step[-1].append([msg_idx, msg])
+                else:
+                    messages_per_step.append([[msg_idx, msg]])
+            elif msg.role == ASSISTANT:
+                if messages_per_step and messages_per_step[-1][-1][1].role == ASSISTANT:
+                    messages_per_step[-1].append([msg_idx, msg])
+                else:
+                    messages_per_step.append([[msg_idx, msg]])
+            elif msg.role == FUNCTION:
+                messages_per_step[-1].append([msg_idx, msg])
+
+        last_step_idx = messages_per_step[-1][0][0]
+
+        # step1: minimized function result
+        logger.debug(f'exceedance step1 **minimized function result**: {exceedance}')
+        for i, (msg_idx, msg) in enumerate(indexed_messages1):
+            if exceedance <= 0 or msg.role != FUNCTION or (is_last_turn and msg_idx >= last_step_idx):
+                continue
+
+            fn_msg_tokens = message_tokens1[msg_idx]
+
+            if fn_msg_tokens > exceedance:  # enough save room, can be truncated
+                msg = _truncate_message(msg=msg, max_tokens=fn_msg_tokens - exceedance, keep_both_sides=True)
+                indexed_messages1[i][1] = msg
+                message_tokens1[msg_idx] = fn_msg_tokens - exceedance
+                exceedance = 0  # force to set to 0 to avoid _truncate_message corner cases since we know there is no exceedance
                 break
             else:
-                token_cnt = (max_tokens - available_token) + cur_token_cnt
+                msg.content = 'omit'
+                message_tokens1[msg_idx] = 0
+                exceedance -= fn_msg_tokens
+        if exceedance <= 0:
+            return [x[1] for x in indexed_messages1], 0
+
+        # step2: rm middle step
+        logger.debug(f'exceedance step2 **rm middle step**: {exceedance}')
+        # keep_messages =
+        keep_idx = 0
+        for i, step in enumerate(messages_per_step):
+            if i == 0 or i == (len(messages_per_step) - 1):
+                continue
+            step_tokens = sum([message_tokens1[x[0]] for x in step])
+            if step_tokens >= exceedance:
+                exceedance = 0
+                keep_idx = messages_per_step[i + 1][0][0]
                 break
-    new_messages = [messages[0]] + new_messages
-    if len(new_messages) < 2:
+            else:
+                exceedance -= step_tokens
+                keep_idx = messages_per_step[i + 1][0][0]
+
+        if exceedance <= 0:
+            res = [x[1] for x in messages_per_step[0]] + [x[1] for x in indexed_messages1 if x[0] >= keep_idx]
+            return res, 0
+
+        # step3: trunk FUNCTION of last step
+        logger.debug(f'exceedance step3 **trunk FUNCTION of last step**: {exceedance}')
+        messages_to_keep = []
+        for msg_idx, msg in messages_per_step[-1]:
+            if msg.role != FUNCTION:
+                messages_to_keep.append([msg_idx, msg])
+                continue
+
+            fn_msg_tokens = message_tokens1[msg_idx]
+
+            if fn_msg_tokens > exceedance:  # enough save room, can be truncated
+                msg = _truncate_message(msg=msg, max_tokens=fn_msg_tokens - exceedance, keep_both_sides=True)
+                exceedance = 0  # force to set to 0 to avoid _truncate_message corner cases since we know there is no exceedance
+            else:
+                msg.content = 'omit'
+                message_tokens1[msg_idx] = 0
+                exceedance -= fn_msg_tokens
+            messages_to_keep.append([msg_idx, msg])
+
+        messages_to_keep = messages_per_step[0] + messages_to_keep
+        if exceedance <= 0:
+            return [x[1] for x in messages_to_keep], 0
+
+        # step4: trunk content of user/assistant
+        logger.debug(f'exceedance step4 **trunk content of user/assistant**: {exceedance}')
+        for i, (msg_idx, msg) in enumerate(messages_to_keep):
+            fn_msg_tokens = message_tokens1[msg_idx]
+
+            if fn_msg_tokens > exceedance:  # enough save room, can be truncated
+                msg = _truncate_message(msg=msg, max_tokens=fn_msg_tokens - exceedance, keep_both_sides=True)
+                messages_to_keep[i][1] = msg
+                exceedance = 0  # force to set to 0 to avoid _truncate_message corner cases since we know there is no exceedance
+                break
+            else:
+                msg.content = 'omit'
+                exceedance -= fn_msg_tokens
+
+        return [x[1] for x in messages_to_keep], 0
+
+    available_token = max_tokens
+    message_tokens = defaultdict(int)
+    last_user_idx = None
+    indexed_messages_per_user = defaultdict(list)  # user_msg_idx -> [(msg_idx, msg)...]
+    new_messages = []
+    for msg_idx, msg in enumerate(messages):
+        if msg.role == SYSTEM:
+            new_messages.append(msg)
+            available_token = max_tokens - _count_tokens(msg=msg)
+            continue
+        message_tokens[msg_idx] = _count_tokens(msg=msg)
+        if msg.role == USER:
+            last_user_idx = msg_idx
+        indexed_messages_per_user[last_user_idx].append([msg_idx, msg])
+
+    all_tokens = sum([x for x in message_tokens.values()])
+    logger.info(f'ALL tokens: {all_tokens}, Available tokens: {available_token}')
+    if all_tokens <= available_token:
+        return messages
+    if available_token <= 0:
         raise ModelServiceError(
             code='400',
-            message=f'The input messages exceed the maximum context length ({max_tokens} tokens) after '
-            f'keeping only the system message and the latest one user message (around {token_cnt} tokens). '
-            'To configure the context limit, please specifiy "max_input_tokens" in the model generate_cfg. '
-            f'Example: generate_cfg = {{..., "max_input_tokens": {(token_cnt // 100 + 1) * 100}}}',
+            message=f'The input system has exceed the maximum input context length ({max_tokens} tokens)',
         )
+
+    exceedance = all_tokens - available_token  # make exceedance <= 0 -> ok
+    for it, (user_msg_idx, indexed_messages) in enumerate(indexed_messages_per_user.items()):
+        logger.debug(f'user_msg_idx: {user_msg_idx}, exceedance: {exceedance}')
+        if exceedance <= 0:
+            new_messages += [x[1] for x in indexed_messages]
+            continue
+        else:
+            is_last_turn = (it == len(indexed_messages_per_user) - 1)
+            new_turn, exceedance = _truncate_turn(indexed_messages1=indexed_messages,
+                                                  message_tokens1=message_tokens,
+                                                  exceedance=exceedance,
+                                                  is_last_turn=is_last_turn)
+            if new_turn:
+                new_messages += new_turn
+
     return new_messages
 
 
@@ -579,5 +877,5 @@ def _raise_or_delay(
 
 def _rm_think(text: str) -> str:
     if '</think>' in text:
-        return text.split('</think>')[-1].lstrip()
+        return text.split('</think>')[-1].lstrip('\n')
     return text
